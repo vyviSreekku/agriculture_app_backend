@@ -1,5 +1,11 @@
-import abc
-abc.abstractmethod
+from abc import abstractmethod
+import builtins
+
+builtins.abstractmethod = abstractmethod
+
+from minirag import MiniRAG
+
+# rest of your code...
 from minirag import MiniRAG
 from minirag.utils import EmbeddingFunc
 from typing import List, Dict, Any, Optional
