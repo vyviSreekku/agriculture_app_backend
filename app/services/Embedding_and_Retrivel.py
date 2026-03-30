@@ -1,3 +1,5 @@
+import abc
+abc.abstractmethod
 from minirag import MiniRAG
 from minirag.utils import EmbeddingFunc
 from typing import List, Dict, Any, Optional
