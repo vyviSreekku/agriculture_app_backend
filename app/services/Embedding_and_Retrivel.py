@@ -1,6 +1,8 @@
+from abc import abstractmethod
+import builtins
+
 builtins.abstractmethod = abstractmethod
 
-print("MINIRAG FILE LOADED")
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
@@ -62,40 +64,28 @@ _extraction_queue: List[tuple[str, asyncio.Future]] = []
 _extraction_lock = asyncio.Lock()
 _extraction_task: Optional[asyncio.Task] = None
 
+# ---------------- EMBEDDING MODEL ----------------
 
-# ---------------- EMBEDDING MODEL (LAZY INIT) ----------------
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 5
 TARGET_CHUNK_CHARS = 1800
 
-embedding_model = None
-embedding_func = None
 
-def get_embedding_model():
-    global embedding_model, embedding_func
-    if embedding_model is None:
-        print("[DEBUG] Step 1: Loading embedding model...")
-        logging.info(f"[INIT] Loading embedding model: {EMBED_MODEL}")
-        from sentence_transformers import SentenceTransformer
-        embedding_model = SentenceTransformer(EMBED_MODEL)
-        print("[DEBUG] Step 2: Embedding model loaded")
-        logging.info("[INIT] ✓ Embedding model loaded")
-        def _embedding_func_impl(texts: List[str]) -> List[List[float]]:
-            print(f"[DEBUG] Step 3: Generating embeddings for {len(texts)} text(s)...")
-            logging.info(f"[EMBEDDING] Generating embeddings for {len(texts)} text(s)...")
-            result = embedding_model.encode(texts, convert_to_tensor=False).tolist()
-            print("[DEBUG] Step 4: Embeddings generated")
-            logging.info("[EMBEDDING] ✓ Embeddings generated")
-            return result
-        global embedding_func
-        print("[DEBUG] Step 5: Creating EmbeddingFunc wrapper")
-        embedding_func = EmbeddingFunc(
-            embedding_dim=embedding_model.get_sentence_embedding_dimension(),
-            max_token_size=512,
-            func=_embedding_func_impl
-        )
-        print("[DEBUG] Step 6: EmbeddingFunc ready")
-    return embedding_model, embedding_func
+logging.info(f"[INIT] Loading embedding model: {EMBED_MODEL}")
+embedding_model = SentenceTransformer(EMBED_MODEL)
+logging.info("[INIT] ✓ Embedding model loaded")
+
+async def embedding_func_impl(texts: List[str]) -> List[List[float]]:
+    logging.info(f"[EMBEDDING] Generating embeddings for {len(texts)} text(s)...")
+    result = embedding_model.encode(texts, convert_to_tensor=False).tolist()
+    logging.info("[EMBEDDING] ✓ Embeddings generated")
+    return result
+
+embedding_func = EmbeddingFunc(
+    embedding_dim=embedding_model.get_sentence_embedding_dimension(),
+    max_token_size=512,
+    func=embedding_func_impl
+)
 
 # ---------------- DISABLE ENTITY EXTRACTION ----------------
 
@@ -237,32 +227,24 @@ def run_async(coro):
         asyncio.set_event_loop(loop)
     return loop.run_until_complete(coro)
 
-
-# ---------------- LAZY INIT MINIRAG ----------------
-rag = None
+# ---------------- INITIALIZE MINIRAG ----------------
 
 def init_minirag():
-    global rag
-    if rag is not None:
-        print("[DEBUG] MiniRAG already initialized")
-        return rag
-    print("[DEBUG] Step 1: Initializing MiniRAG...")
+
     logging.info("[INIT] Initializing MiniRAG...")
-    print("[DEBUG] Step 2: Ensuring minirag_storage directory exists")
+
+
     os.makedirs("./minirag_storage", exist_ok=True)
-    print("[DEBUG] Step 3: Getting embedding model and func")
-    _, emb_func = get_embedding_model()
-    print("[DEBUG] Step 4: Creating MiniRAG instance")
-    rag_instance = MiniRAG(
+
+    rag = MiniRAG(
         working_dir="./minirag_storage",
         chunk_token_size=900,
         chunk_overlap_token_size=150,
-        embedding_func=emb_func,
+        embedding_func=embedding_func,
         llm_model_func=gemini_llm_func,
     )
-    print("[DEBUG] Step 5: MiniRAG instance created")
+
     logging.info("[INIT] ✓ MiniRAG initialized successfully")
-    rag = rag_instance
     return rag
 
 # ---------------- JSON → NATURAL LANGUAGE FORMATTER ----------------
@@ -379,20 +361,15 @@ def merge_into_large_chunks(records: List[Dict[str, str]], target_chars: int = T
 
 
 def load_json_file(file_path: str) -> List[str]:
-    print(f"[DEBUG] Step 1: Loading JSON file: {file_path}")
     logging.info(f"[LOAD] Loading JSON file: {file_path}")
 
     with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    print("[DEBUG] Step 2: Extracting text from JSON")
+
     records = extract_text_from_json(data)
-    print("[DEBUG] Step 3: Merging into large chunks")
     large_chunks = merge_into_large_chunks(records)
 
     detected_groups = sorted({item["group"] for item in records if item.get("group")})
-    print(f"[DEBUG] Step 4: Extracted {len(records)} raw text pieces from JSON")
-    print(f"[DEBUG] Step 5: Auto-detected groups: {len(detected_groups)}")
-    print(f"[DEBUG] Step 6: Merged into {len(large_chunks)} large chunks")
     logging.info(f"[LOAD] ✓ Extracted {len(records)} raw text pieces from JSON")
     logging.info(f"[LOAD] ✓ Auto-detected groups: {len(detected_groups)}")
     logging.info(f"[LOAD] ✓ Merged into {len(large_chunks)} large chunks")
@@ -400,20 +377,16 @@ def load_json_file(file_path: str) -> List[str]:
 
 
 def add_json_files(rag: MiniRAG, json_paths: List[str]):
-    print(f"[DEBUG] Step 1: Processing {len(json_paths)} JSON file(s)...")
     logging.info(f"[INSERT] Processing {len(json_paths)} JSON file(s)...")
 
     for i, path in enumerate(json_paths, 1):
-        print(f"[DEBUG] Step 2: Processing file {i}/{len(json_paths)}: {path}")
         logging.info(f"[INSERT] File {i}/{len(json_paths)}: {path}")
 
         texts = load_json_file(path)
 
-        print(f"[DEBUG] Step 3: Inserting {len(texts)} texts into RAG system...")
         logging.info(f"[INSERT] Inserting {len(texts)} texts into RAG system...")
         run_async(rag.ainsert(texts))
 
-        print(f"[DEBUG] Step 4: Successfully inserted texts from {os.path.basename(path)}")
         logging.info(f"[INSERT] ✓ Successfully inserted texts from {os.path.basename(path)}")
 
 # ---------------- QUERY NORMALIZATION ----------------
