@@ -35,11 +35,12 @@ load_dotenv()
 
 # 🔴 IMPORTANT: DO NOT hardcode key in real project
 # Set GEMINI_API_KEY in your environment or in a .env file
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set. Please set it in your environment before starting the backend.")
+    logging.warning("GEMINI_API_KEY missing")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Try preferred model first, then fall back to broadly available free-tier models.
 MODEL_CANDIDATES = [
@@ -66,23 +67,35 @@ _extraction_task: Optional[asyncio.Task] = None
 
 # ---------------- EMBEDDING MODEL ----------------
 
+
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 5
 TARGET_CHUNK_CHARS = 1800
 
+# Lazy loading for embedding model (Azure safe)
+embedding_model = None
 
-logging.info(f"[INIT] Loading embedding model: {EMBED_MODEL}")
-embedding_model = SentenceTransformer(EMBED_MODEL)
-logging.info("[INIT] ✓ Embedding model loaded")
+def get_embedding_model():
+    global embedding_model
+    if embedding_model is None:
+        logging.info("[INIT] Loading embedding model: %s", EMBED_MODEL)
+        try:
+            embedding_model = SentenceTransformer(EMBED_MODEL)
+            logging.info("[INIT] ✓ Embedding model loaded")
+        except Exception as e:
+            logging.error("[INIT] Failed to load embedding model: %s", e)
+            raise
+    return embedding_model
 
 async def embedding_func_impl(texts: List[str]) -> List[List[float]]:
+    model = get_embedding_model()
     logging.info(f"[EMBEDDING] Generating embeddings for {len(texts)} text(s)...")
-    result = embedding_model.encode(texts, convert_to_tensor=False).tolist()
+    result = model.encode(texts, convert_to_tensor=False).tolist()
     logging.info("[EMBEDDING] ✓ Embeddings generated")
     return result
 
 embedding_func = EmbeddingFunc(
-    embedding_dim=embedding_model.get_sentence_embedding_dimension(),
+    embedding_dim=get_embedding_model().get_sentence_embedding_dimension(),
     max_token_size=512,
     func=embedding_func_impl
 )
