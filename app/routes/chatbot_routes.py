@@ -7,13 +7,12 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.services.Embedding_and_Retrivel import init_minirag, add_json_files, rag_query
+
+from app.services.Embedding_and_Retrivel import rag_query
 
 router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 
-_rag_instance = None
-_rag_lock = Lock()
-_rag_initialized = False
+
 _offline_bundle_cache = None
 _offline_bundle_signature = None
 
@@ -36,28 +35,14 @@ def _dataset_paths() -> list[str]:
     return [str(path) for path in files if path.exists()]
 
 
-def _get_rag():
-    global _rag_instance, _rag_initialized
 
-    if _rag_initialized and _rag_instance is not None:
-        return _rag_instance
+from fastapi import Request
 
-    with _rag_lock:
-        if _rag_initialized and _rag_instance is not None:
-            return _rag_instance
-
-        rag = init_minirag()
-        dataset_files = _dataset_paths()
-
-        if not dataset_files:
-            raise RuntimeError("No dataset files found for chatbot indexing")
-
-        add_json_files(rag, dataset_files)
-
-        _rag_instance = rag
-        _rag_initialized = True
-
-    return _rag_instance
+def _get_rag_from_app(request: Request):
+    rag = getattr(request.app.state, "rag", None)
+    if rag is None:
+        raise RuntimeError("MiniRAG is not initialized. Please check server logs for errors.")
+    return rag
 
 
 def _build_offline_rag_bundle() -> dict:
@@ -122,10 +107,11 @@ def chatbot_health():
     return {"status": "ok", "service": "chatbot"}
 
 
+
 @router.get("/offline-rag-bundle")
-def chatbot_offline_rag_bundle():
+def chatbot_offline_rag_bundle(request: Request):
     try:
-        _get_rag()
+        _get_rag_from_app(request)
         return _build_offline_rag_bundle()
     except HTTPException:
         raise
@@ -133,15 +119,16 @@ def chatbot_offline_rag_bundle():
         raise HTTPException(status_code=500, detail=f"Offline RAG bundle failed: {exc}") from exc
 
 
+
 @router.post("/query", response_model=ChatbotQueryResponse)
-def chatbot_query(payload: ChatbotQueryRequest):
+def chatbot_query(payload: ChatbotQueryRequest, request: Request):
     question = payload.question.strip()
 
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     try:
-        rag = _get_rag()
+        rag = _get_rag_from_app(request)
         answer = rag_query(rag, question)
         return ChatbotQueryResponse(question=question, answer=answer)
     except HTTPException:

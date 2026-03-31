@@ -14,16 +14,43 @@ from app.routes import soil_ph_routes
 from app.routes import user_routes
 from app.routes import chatbot_routes
 from .database import Base, engine
-
 from .models import user  
 from .models import crop
 from .models import community_post
 from .models import community_post_image
 from .models import community_comment
 
+# --- MiniRAG imports for startup initialization ---
+from app.services.Embedding_and_Retrivel import init_minirag, add_json_files
+import logging
+
+def _dataset_paths():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    files = [
+        root / "dataset" / "pest.json",
+        root / "dataset" / "weed.json",
+        root / "dataset" / "village_plant_disease_dataset.json",
+    ]
+    return [str(path) for path in files if path.exists()]
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # --- MiniRAG and dataset initialization ---
+    try:
+        logging.info("[STARTUP] Initializing MiniRAG and loading datasets...")
+        rag = init_minirag()
+        dataset_files = _dataset_paths()
+        if dataset_files:
+            add_json_files(rag, dataset_files)
+        else:
+            logging.warning("[STARTUP] No dataset files found for MiniRAG initialization.")
+        app.state.rag = rag
+        logging.info("[STARTUP] MiniRAG and datasets loaded successfully.")
+    except Exception as exc:
+        logging.exception(f"[STARTUP] MiniRAG initialization failed: {exc}")
+        app.state.rag = None
     yield
 
 app = FastAPI(lifespan=lifespan)
