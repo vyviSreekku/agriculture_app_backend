@@ -69,6 +69,10 @@ _extraction_task: Optional[asyncio.Task] = None
 
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# all-MiniLM-L6-v2 has fixed embedding dimension of 384.
+# Using the known dimension here avoids loading the model at import time,
+# which makes Azure startup much faster and more reliable.
+EMBED_DIM = 384
 TOP_K = 5
 TARGET_CHUNK_CHARS = 1800
 
@@ -95,7 +99,10 @@ async def embedding_func_impl(texts: List[str]) -> List[List[float]]:
     return result
 
 embedding_func = EmbeddingFunc(
-    embedding_dim=get_embedding_model().get_sentence_embedding_dimension(),
+    # Use the known dimension instead of forcing an embedding model
+    # load during module import. The model will be loaded lazily on
+    # first real embedding call.
+    embedding_dim=EMBED_DIM,
     max_token_size=512,
     func=embedding_func_impl
 )

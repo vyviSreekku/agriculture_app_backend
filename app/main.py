@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
 import os
+from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import weather_routes, market_routes
 from app.routes import community_routes
@@ -34,20 +35,43 @@ def _dataset_paths():
     ]
     return [str(path) for path in files if path.exists()]
 
+
+def _minirag_storage_has_index() -> bool:
+    """Check if a prebuilt MiniRAG index already exists.
+
+    If the vector DB files are present, we can skip the expensive
+    dataset ingestion step during app startup. This is important
+    for Azure App Service, which has a strict startup time limit.
+    """
+    root = Path(__file__).resolve().parents[1]
+    storage_dir = root / "minirag_storage"
+    vdb_path = storage_dir / "vdb_chunks.json"
+    text_path = storage_dir / "kv_store_text_chunks.json"
+    return vdb_path.exists() and text_path.exists()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     # --- MiniRAG and dataset initialization ---
     try:
-        logging.info("[STARTUP] Initializing MiniRAG and loading datasets...")
+        logging.info("[STARTUP] Initializing MiniRAG...")
         rag = init_minirag()
-        dataset_files = _dataset_paths()
-        if dataset_files:
-            add_json_files(rag, dataset_files)
+
+        if _minirag_storage_has_index():
+            # We already have a prebuilt index (minirag_storage/*). Avoid
+            # re-ingesting JSON on every container start to keep Azure
+            # startup times well within limits.
+            logging.info("[STARTUP] Existing MiniRAG index detected; skipping dataset ingestion.")
         else:
-            logging.warning("[STARTUP] No dataset files found for MiniRAG initialization.")
+            logging.info("[STARTUP] No existing MiniRAG index detected; loading datasets once...")
+            dataset_files = _dataset_paths()
+            if dataset_files:
+                add_json_files(rag, dataset_files)
+            else:
+                logging.warning("[STARTUP] No dataset files found for MiniRAG initialization.")
+
         app.state.rag = rag
-        logging.info("[STARTUP] MiniRAG and datasets loaded successfully.")
+        logging.info("[STARTUP] MiniRAG initialization complete.")
     except Exception as exc:
         logging.exception(f"[STARTUP] MiniRAG initialization failed: {exc}")
         app.state.rag = None
