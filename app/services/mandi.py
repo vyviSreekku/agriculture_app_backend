@@ -14,7 +14,7 @@ def get_mandi_prices(
     arrival_date: Optional[str] = None,
     api_key: str = None,
     format: str = "json",
-    offset: int = 0,
+    offset: int = 15,
     sort_by: str = "Market"
 ) -> Union[Dict[str, Any], str, None]:
     """
@@ -59,7 +59,7 @@ def get_mandi_prices(
         params[f"sort[{sort_by}]"] = "asc"
     
     try:
-        response = requests.get(BASE_URL, params=params)
+        response = requests.get(BASE_URL, params=params, timeout=60)  # 60 second timeout for very slow API
         response.raise_for_status()  # Raise exception for bad responses
         
         if format == "json":
@@ -79,7 +79,7 @@ def process_mandi_data(data: Dict[str, Any], max_records: Optional[int] = None) 
     - max_records: Maximum number of records to process
     
     Returns:
-    - List of processed market price records
+    - List of processed market price records sorted by date descending
     """
     processed_data = []
     
@@ -97,11 +97,18 @@ def process_mandi_data(data: Dict[str, Any], max_records: Optional[int] = None) 
     if not records:
         return processed_data
     
+    # Sort all records by arrival date (newest first) before processing
+    sorted_all_records = sorted(
+        records,
+        key=lambda x: datetime.strptime(x.get("Arrival_Date", "01/01/2000"), "%d/%m/%Y"),
+        reverse=True
+    )
+    
     # Limit the number of records to process
-    if max_records and max_records < len(records):
-        records_to_process = records[:max_records]
+    if max_records and max_records < len(sorted_all_records):
+        records_to_process = sorted_all_records[:max_records]
     else:
-        records_to_process = records
+        records_to_process = sorted_all_records
     
     # Group records by Market and Commodity for better organization
     market_commodity_groups = {}
@@ -121,20 +128,13 @@ def process_mandi_data(data: Dict[str, Any], max_records: Optional[int] = None) 
         market = parts[0]
         commodity = parts[1] if len(parts) > 1 else "Unknown"
         
-        # Sort records by arrival date (newest first)
-        sorted_records = sorted(
-            group_records, 
-            key=lambda x: datetime.strptime(x.get("Arrival_Date", "01/01/2000"), "%d/%m/%Y"), 
-            reverse=True
-        )
-        
         group_data = {
             "market": market,
             "commodity": commodity,
             "prices": []
         }
         
-        for record in sorted_records:
+        for record in group_records:
             # Format date for better readability
             arrival_date = record.get("Arrival_Date", "N/A")
             try:
@@ -165,63 +165,24 @@ async def get_crop_prices(
     district: Optional[str] = None,
     crop: Optional[str] = None,
     arrival_date: Optional[str] = None,
+    limit_days: int = 1,
+    limit: int = 15,
 ) -> Dict[str, Any]:
     """
     Get crop prices from the Mandi API as a service for the FastAPI backend.
+    Simple single-call approach matching the curl logic.
     
     Parameters:
     - state: Filter by state
     - district: Filter by district
     - crop: Filter by crop name (commodity)
+    - arrival_date: Optional specific arrival date in dd/mm/YYYY format
+    - limit_days: Ignored (kept for backward compatibility)
+    - limit: Maximum number of records to return (default: 15)
     
     Returns:
     - Dictionary containing processed market price data and metadata
     """
-    # Set a reasonable limit for API calls
-    # If no arrival_date is provided, start from 7 days ago
-    # and move backwards day by day (up to ~1 month) until some data is found.
-    if arrival_date is None:
-        start_date = datetime.now()
-    else:
-        # Parse provided arrival_date; if parsing fails, fall back to today
-        try:
-            start_date = datetime.strptime(arrival_date, "%d/%m/%Y")
-        except ValueError:
-            start_date = datetime.now()
-
-    import concurrent.futures
-
-    data = None
-    effective_date_str = None
-    max_days = 30
-    batch_size = 3
-    found = False
-
-    def fetch_for_date(offset):
-        query_date = start_date - timedelta(days=offset)
-        date_str = query_date.strftime("%d/%m/%Y")
-        d = get_mandi_prices(
-            state=state,
-            district=district,
-            commodity=crop,
-            arrival_date=date_str,
-        )
-        return (date_str, d)
-
-    for batch_start in range(0, max_days + 1, batch_size):
-        offsets = list(range(batch_start, min(batch_start + batch_size, max_days + 1)))
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            results = list(executor.map(fetch_for_date, offsets))
-        # Sort by earliest date (lowest offset)
-        for date_str, d in sorted(results, key=lambda x: x[0]):
-            if d and isinstance(d, dict) and d.get("records") and not d.get("error"):
-                data = d
-                effective_date_str = date_str
-                found = True
-                break
-        if found:
-            break
-    
     result = {
         "success": False,
         "data": [],
@@ -232,19 +193,24 @@ async def get_crop_prices(
             "state": state,
             "district": district,
             "crop": crop,
-            # The actual Arrival_Date used for the successful query (dd/mm/YYYY)
-            "effective_arrival_date": effective_date_str,
         },
     }
-
-    if data and isinstance(data, dict) and effective_date_str is not None:
-        # Extract metadata
+    
+    # Simple single API call with provided filters
+    data = get_mandi_prices(
+        state=state,
+        district=district,
+        commodity=crop,
+        arrival_date=arrival_date,
+    )
+    
+    # Check if we got valid data
+    if data and isinstance(data, dict) and data.get("records") and not data.get("error"):
         result["success"] = True
         result["metadata"]["total_records"] = data.get("total", 0)
         result["metadata"]["fetched_records"] = len(data.get("records", []))
         result["metadata"]["updated_date"] = data.get("updated_date", None)
-
-        # Process the data
-        result["data"] = process_mandi_data(data)
-
+        # Process with limit
+        result["data"] = process_mandi_data(data, max_records=limit)
+    
     return result

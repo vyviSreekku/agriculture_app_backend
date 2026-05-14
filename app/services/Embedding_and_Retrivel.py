@@ -1,25 +1,14 @@
-from abc import abstractmethod
-import builtins
-
-builtins.abstractmethod = abstractmethod
-
-
-import logging
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
-
 from minirag import MiniRAG
 from minirag.utils import EmbeddingFunc
 from typing import List, Dict, Any, Optional
 import json
 import os
 import time
-import threading
 import asyncio
 import warnings
 import re
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
 
 # Suppress MiniRAG graph warnings (clean console)
 warnings.filterwarnings("ignore", category=UserWarning, module="minirag")
@@ -31,16 +20,12 @@ from google import genai
 # 🔴 IMPORTANT: DO NOT hardcode key in real project
 # Set once in terminal:
 # setx GEMINI_API_KEY "YOUR_API_KEY"
-load_dotenv()
 
-# 🔴 IMPORTANT: DO NOT hardcode key in real project
-# Set GEMINI_API_KEY in your environment or in a .env file
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyADsKd9Vl967GhthoVwHFjKKM3phu6sde0").strip()
 if not GEMINI_API_KEY:
-    logging.warning("GEMINI_API_KEY missing")
+    raise RuntimeError("GEMINI_API_KEY is not set. Please set it in your environment before starting the backend.")
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Try preferred model first, then fall back to broadly available free-tier models.
 MODEL_CANDIDATES = [
@@ -50,193 +35,34 @@ MODEL_CANDIDATES = [
 ]
 MODEL_NAME = MODEL_CANDIDATES[0]
 
-
-# --- Rate limiting: 1 request per minute ---
 LAST_CALL = 0
-MIN_INTERVAL = 60  # seconds
-_rate_limit_lock = threading.Lock()
-
-# Batching configuration for entity extraction (to reduce Gemini calls)
-BATCH_SIZE = 64
-BATCH_TIMEOUT = 3.0  # seconds to wait for more items before flushing
-
-# internal batching state
-_extraction_queue: List[tuple[str, asyncio.Future]] = []
-_extraction_lock = asyncio.Lock()
-_extraction_task: Optional[asyncio.Task] = None
+MIN_INTERVAL = 60   # 1 call per minute (safe for free tier)
 
 # ---------------- EMBEDDING MODEL ----------------
 
-
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# all-MiniLM-L6-v2 has fixed embedding dimension of 384.
-# Using the known dimension here avoids loading the model at import time,
-# which makes Azure startup much faster and more reliable.
-EMBED_DIM = 384
 TOP_K = 5
 TARGET_CHUNK_CHARS = 1800
 
-# Lazy loading for embedding model (Azure safe)
-embedding_model = None
-
-def get_embedding_model():
-    global embedding_model
-    if embedding_model is None:
-        logging.info("[INIT] Loading embedding model: %s", EMBED_MODEL)
-        try:
-            embedding_model = SentenceTransformer(EMBED_MODEL)
-            logging.info("[INIT] ✓ Embedding model loaded")
-        except Exception as e:
-            logging.error("[INIT] Failed to load embedding model: %s", e)
-            raise
-    return embedding_model
+embedding_model = SentenceTransformer(EMBED_MODEL)
 
 async def embedding_func_impl(texts: List[str]) -> List[List[float]]:
-    model = get_embedding_model()
-    logging.info(f"[EMBEDDING] Generating embeddings for {len(texts)} text(s)...")
-    result = model.encode(texts, convert_to_tensor=False).tolist()
-    logging.info("[EMBEDDING] ✓ Embeddings generated")
+    print(f"[EMBEDDING] Generating embeddings for {len(texts)} text(s)...")
+    result = embedding_model.encode(texts, convert_to_tensor=False).tolist()
+    print("[EMBEDDING] ✓ Embeddings generated")
     return result
 
 embedding_func = EmbeddingFunc(
-    # Use the known dimension instead of forcing an embedding model
-    # load during module import. The model will be loaded lazily on
-    # first real embedding call.
-    embedding_dim=EMBED_DIM,
+    embedding_dim=embedding_model.get_sentence_embedding_dimension(),
     max_token_size=512,
     func=embedding_func_impl
 )
 
 # ---------------- DISABLE ENTITY EXTRACTION ----------------
 
-# ---------------- GEMINI-BASED ENTITY EXTRACTION ----------------
+async def gemini_llm_func_noop(prompt: str, **kwargs) -> str:
+    return json.dumps({"entities": [], "keywords": []})
 
-async def gemini_llm_func(prompt: str, **kwargs) -> str:
-    """Batched Gemini extraction: queue the prompt and wait for
-    the batch worker to call Gemini and return per-prompt results.
-    Returns a JSON string: {"entities": [...], "keywords": [...]}.
-    """
-    global _extraction_task
-
-    loop = asyncio.get_event_loop()
-    fut: asyncio.Future = loop.create_future()
-
-    # enqueue prompt and start worker if needed
-    async with _extraction_lock:
-        _extraction_queue.append((prompt, fut))
-        if _extraction_task is None or _extraction_task.done():
-            logging.info("[GEMINI] Starting batch worker for entity extraction")
-            _extraction_task = asyncio.create_task(_batch_worker())
-
-    # wait for result
-    try:
-        result = await fut
-        return result
-    except Exception:
-        logging.error("[GEMINI] Exception in gemini_llm_func", exc_info=True)
-        return json.dumps({"entities": [], "keywords": []})
-
-
-async def _batch_worker():
-    """Flush queued prompts in batches. Each batch is sent as one Gemini
-    request which returns a JSON containing per-item results.
-    """
-    global _extraction_queue, _extraction_task, LAST_CALL
-
-    while True:
-        # wait a short period to allow batch to grow
-        await asyncio.sleep(BATCH_TIMEOUT)
-
-        async with _extraction_lock:
-            if not _extraction_queue:
-                _extraction_task = None
-                return
-            batch = _extraction_queue[:BATCH_SIZE]
-            _extraction_queue = _extraction_queue[BATCH_SIZE:]
-
-        prompts = [p for p, _ in batch]
-
-        # build combined prompt
-        combined = """
-Extract entities and keywords for each numbered item. Respond ONLY with a JSON
-object: {"results": [{"index":0,"entities": [...],"keywords":[...]}, ...]}
-
-Items:
-"""
-        for i, p in enumerate(prompts):
-            combined += f"\n--- ITEM {i} ---\n{p}\n"
-
-        # Rate-limit global calls
-        now = time.time()
-        wait_time = MIN_INTERVAL - (now - LAST_CALL)
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
-
-        # Call Gemini with retries/backoff to handle 429s
-        text = ""
-        backoff = 1
-        for attempt in range(4):
-            try:
-                print(f"[BATCH] Attempt {attempt+1}: sending batch of {len(prompts)} prompts (MODEL={MODEL_NAME})")
-                resp = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: client.models.generate_content(model=MODEL_NAME, contents=combined),
-                )
-                text = getattr(resp, "text", "") or ""
-                print(f"[BATCH] ✓ Received response (len={len(text)})")
-                # show preview for debugging
-                preview = text[:300].replace('\n', ' ')
-                print(f"[BATCH] Response preview: {preview}")
-                break
-            except Exception as e:
-                status = getattr(e, "status_code", None)
-                msg = str(e)
-                # Retry on rate limit errors
-                if status == 429 or "429" in msg or "Too Many Requests" in msg:
-                    print(f"[BATCH][WARN] rate limited (attempt {attempt+1}), sleeping {backoff}s")
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 30)
-                    continue
-                # non-retryable error -> break
-                print(f"[BATCH][ERROR] Non-retryable error: {e}")
-                break
-
-        LAST_CALL = time.time()
-
-        # parse response
-        results_map = {}
-        try:
-            parsed = json.loads(text)
-            # Expect either {"results": [...]}
-            if isinstance(parsed, dict) and "results" in parsed and isinstance(parsed["results"], list):
-                for item in parsed["results"]:
-                    idx = item.get("index")
-                    if idx is None:
-                        continue
-                    results_map[int(idx)] = {"entities": item.get("entities", []), "keywords": item.get("keywords", [])}
-        except Exception:
-            m = re.search(r"(\{.*\})", text, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(1))
-                    if isinstance(parsed, dict) and "results" in parsed and isinstance(parsed["results"], list):
-                        for item in parsed["results"]:
-                            idx = item.get("index")
-                            if idx is None:
-                                continue
-                            results_map[int(idx)] = {"entities": item.get("entities", []), "keywords": item.get("keywords", [])}
-                except Exception:
-                    results_map = {}
-
-        # set futures
-        for i, (_, fut) in enumerate(batch):
-            res = results_map.get(i, {"entities": [], "keywords": []})
-            if not fut.done():
-                # small debug: how many entities/keywords
-                ent_count = len(res.get("entities", [])) if isinstance(res, dict) else 0
-                kw_count = len(res.get("keywords", [])) if isinstance(res, dict) else 0
-                print(f"[BATCH] Resolving future idx={i} entities={ent_count} keywords={kw_count}")
-                fut.set_result(json.dumps(res))
 # ---------------- ASYNC HELPER ----------------
 
 def run_async(coro):
@@ -250,9 +76,7 @@ def run_async(coro):
 # ---------------- INITIALIZE MINIRAG ----------------
 
 def init_minirag():
-
-    logging.info("[INIT] Initializing MiniRAG...")
-
+    print("[INIT] Initializing MiniRAG...")
 
     os.makedirs("./minirag_storage", exist_ok=True)
 
@@ -261,10 +85,10 @@ def init_minirag():
         chunk_token_size=900,
         chunk_overlap_token_size=150,
         embedding_func=embedding_func,
-        llm_model_func=gemini_llm_func,
+        llm_model_func=gemini_llm_func_noop
     )
 
-    logging.info("[INIT] ✓ MiniRAG initialized successfully")
+    print("[INIT] ✓ MiniRAG initialized successfully")
     return rag
 
 # ---------------- JSON → NATURAL LANGUAGE FORMATTER ----------------
@@ -381,7 +205,7 @@ def merge_into_large_chunks(records: List[Dict[str, str]], target_chars: int = T
 
 
 def load_json_file(file_path: str) -> List[str]:
-    logging.info(f"[LOAD] Loading JSON file: {file_path}")
+    print(f"[LOAD] Loading JSON file: {file_path}")
 
     with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -390,24 +214,24 @@ def load_json_file(file_path: str) -> List[str]:
     large_chunks = merge_into_large_chunks(records)
 
     detected_groups = sorted({item["group"] for item in records if item.get("group")})
-    logging.info(f"[LOAD] ✓ Extracted {len(records)} raw text pieces from JSON")
-    logging.info(f"[LOAD] ✓ Auto-detected groups: {len(detected_groups)}")
-    logging.info(f"[LOAD] ✓ Merged into {len(large_chunks)} large chunks")
+    print(f"[LOAD] ✓ Extracted {len(records)} raw text pieces from JSON")
+    print(f"[LOAD] ✓ Auto-detected groups: {len(detected_groups)}")
+    print(f"[LOAD] ✓ Merged into {len(large_chunks)} large chunks")
     return large_chunks
 
 
 def add_json_files(rag: MiniRAG, json_paths: List[str]):
-    logging.info(f"[INSERT] Processing {len(json_paths)} JSON file(s)...")
+    print(f"\n[INSERT] Processing {len(json_paths)} JSON file(s)...")
 
     for i, path in enumerate(json_paths, 1):
-        logging.info(f"[INSERT] File {i}/{len(json_paths)}: {path}")
+        print(f"\n[INSERT] File {i}/{len(json_paths)}: {path}")
 
         texts = load_json_file(path)
 
-        logging.info(f"[INSERT] Inserting {len(texts)} texts into RAG system...")
+        print(f"[INSERT] Inserting {len(texts)} texts into RAG system...")
         run_async(rag.ainsert(texts))
 
-        logging.info(f"[INSERT] ✓ Successfully inserted texts from {os.path.basename(path)}")
+        print(f"[INSERT] ✓ Successfully inserted texts from {os.path.basename(path)}")
 
 # ---------------- QUERY NORMALIZATION ----------------
 
@@ -418,19 +242,20 @@ def normalize_query(q: str) -> str:
 # ---------------- RETRIEVAL (FINAL FIXED VERSION) ----------------
 
 def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
-    logging.info(f"[RETRIEVE] Searching for top {top_k} relevant chunks...")
-    logging.info(f"[RETRIEVE] Query: {query}")
+    print(f"\n[RETRIEVE] Searching for top {top_k} relevant chunks...")
+    print(f"[RETRIEVE] Query: {query}")
+    
     try:
         # Step 1: Generate embedding for query
         embeddings = run_async(embedding_func_impl([query]))
         query_embedding = np.array(embeddings[0], dtype=np.float32)
-        logging.info(f"[RETRIEVE] Generated query embedding (dim={len(query_embedding)})")
+        print(f"[RETRIEVE] Generated query embedding (dim={len(query_embedding)})")
 
         # Step 2: Load vector DB (embeddings) and text chunks
         vdb_path = "./minirag_storage/vdb_chunks.json"
         text_path = "./minirag_storage/kv_store_text_chunks.json"
         if not os.path.exists(vdb_path) or not os.path.exists(text_path):
-            logging.warning(f"[DEBUG] Missing storage files; vdb_chunks or kv_store_text_chunks not found")
+            print(f"[DEBUG] Missing storage files; vdb_chunks or kv_store_text_chunks not found")
             return []
 
         with open(vdb_path, "r", encoding="utf-8") as f:
@@ -440,7 +265,7 @@ def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
 
         # Parse matrix embeddings (base64-encoded float32 array)
         if not isinstance(vdb_data, dict) or "data" not in vdb_data or "matrix" not in vdb_data:
-            logging.warning("[DEBUG] Invalid vdb_chunks.json structure")
+            print("[DEBUG] Invalid vdb_chunks.json structure")
             return []
 
         ids = [item.get("__id__") for item in vdb_data["data"] if isinstance(item, dict)]
@@ -451,17 +276,17 @@ def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
         matrix = np.frombuffer(matrix_bytes, dtype=np.float32)
         dim = vdb_data.get("embedding_dim", len(query_embedding))
         if dim == 0:
-            logging.warning("[DEBUG] embedding_dim is zero")
+            print("[DEBUG] embedding_dim is zero")
             return []
         rows = matrix.size // dim
         if rows == 0:
-            logging.warning("[DEBUG] No embedding rows decoded")
+            print("[DEBUG] No embedding rows decoded")
             return []
         matrix = matrix.reshape((rows, dim))
 
         # Step 3: Compute similarities
         if len(ids) != rows:
-            logging.warning(f"[DEBUG] ID count {len(ids)} != embedding rows {rows}")
+            print(f"[DEBUG] ID count {len(ids)} != embedding rows {rows}")
         count = min(len(ids), rows)
 
         similarities = []
@@ -484,7 +309,7 @@ def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
             similarities.append((sim, content, cid))
 
         if not similarities:
-            logging.warning("[DEBUG] No similarities computed (missing content?)")
+            print("[DEBUG] No similarities computed (missing content?)")
             return []
 
         similarities.sort(key=lambda x: x[0], reverse=True)
@@ -492,14 +317,18 @@ def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
 
         chunks = [content for sim, content, cid in top_results]
 
-        logging.info(f"[RETRIEVE] ✓ Retrieved {len(chunks)} chunk(s)")
+        print(f"[RETRIEVE] ✓ Retrieved {len(chunks)} chunk(s)")
         for i, (sim, content, cid) in enumerate(top_results):
             preview = content[:100].replace("\n", " ") if len(content) > 100 else content
-            logging.info(f"  [Result {i+1}] Sim: {sim:.4f} | id={cid} | {preview}...")
+            print(f"  [Result {i+1}] Sim: {sim:.4f} | id={cid} | {preview}...")
 
         return chunks
+    
     except Exception as e:
-        logging.error(f"[DEBUG] Retrieval error: {type(e).__name__}: {e}", exc_info=True)
+        print(f"[DEBUG] Retrieval error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+    
     return []
 
 # ---------------- GEMINI GENERATION ----------------
@@ -507,17 +336,15 @@ def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
 def gemini_generate(context: str, question: str) -> str:
     global LAST_CALL
 
-    logging.info("[GENERATE] Preparing to call Gemini API...")
+    print("\n[GENERATE] Preparing to call Gemini API...")
 
-    # --- Strict rate limiting: 1 request per minute ---
-    global LAST_CALL
-    with _rate_limit_lock:
-        now = time.time()
-        wait_time = MIN_INTERVAL - (now - LAST_CALL)
-        if wait_time > 0:
-            logging.info(f"[RATE LIMIT] Waiting {wait_time:.1f} seconds...")
-            time.sleep(wait_time)
-        LAST_CALL = time.time()
+    # Rate limiting
+    now = time.time()
+    wait_time = MIN_INTERVAL - (now - LAST_CALL)
+    if wait_time > 0:
+        print(f"[RATE LIMIT] Waiting {wait_time:.1f} seconds...")
+        time.sleep(wait_time)
+    LAST_CALL = time.time()
 
     # Limit context size
     MAX_CONTEXT_CHARS = 3000
@@ -544,14 +371,14 @@ Answer:
 
     for model_name in MODEL_CANDIDATES:
         try:
-            logging.info(f"[API CALL] Sending request to {model_name}...")
+            print(f"[API CALL] Sending request to {model_name}...")
 
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
             )
 
-            logging.info(f"[API CALL] ✓ Response received from {model_name}")
+            print(f"[API CALL] ✓ Response received from {model_name}")
             return response.text or "No response text received from Gemini."
 
         except Exception as e:
@@ -564,8 +391,9 @@ Answer:
             if resp_obj is not None:
                 response_text = getattr(resp_obj, "text", "") or ""
 
-            logging.error(
-                f"[API ERROR] model={model_name} status={status_code} message={message}" + (f" body={response_text}" if response_text else "")
+            print(
+                f"[API ERROR] model={model_name} status={status_code} message={message}"
+                + (f" body={response_text}" if response_text else "")
             )
 
     raise RuntimeError(f"Gemini API failed for all fallback models. Last error: {last_error}")
@@ -573,33 +401,33 @@ Answer:
 # ---------------- FULL RAG QUERY ----------------
 
 def rag_query(rag: MiniRAG, question: str) -> str:
-    logging.info("=" * 60)
-    logging.info("[RAG QUERY] Starting RAG query")
-    logging.info(f"[RAG QUERY] Original question: {question}")
-    logging.info("=" * 60)
+
+    print("\n" + "=" * 60)
+    print("[RAG QUERY] Starting RAG query")
+    print("[RAG QUERY] Original question:", question)
+    print("=" * 60)
 
     question_norm = normalize_query(question)
 
     retrieved_docs = retrieve_with_minirag(rag, question_norm, TOP_K)
 
     if not retrieved_docs:
-        logging.warning("[RAG QUERY] ⚠ No relevant context found, falling back to model knowledge")
+        print("\n[RAG QUERY] ⚠ No relevant context found, falling back to model knowledge")
         answer = gemini_generate("", question)
-        logging.info("[RAG QUERY] ✓ Query completed with fallback knowledge")
-        logging.info("=" * 60)
+        print("\n[RAG QUERY] ✓ Query completed with fallback knowledge")
+        print("=" * 60 + "\n")
         return answer
 
-    logging.info("================ RETRIEVED CONTEXT ================")
+    print("\n================ RETRIEVED CONTEXT ================\n")
     for i, doc in enumerate(retrieved_docs):
-        preview = doc[:500].replace("\n", " ") if len(doc) > 500 else doc
-        logging.info(f"[Chunk {i+1}] {preview}")
-    logging.info("===================================================")
+        print(f"[Chunk {i+1}]\n{doc[:500]}\n")
+    print("===================================================\n")
 
     context = "\n\n".join(retrieved_docs)
 
     answer = gemini_generate(context, question)
 
-    logging.info("[RAG QUERY] ✓ Query completed successfully")
-    logging.info("=" * 60)
+    print("\n[RAG QUERY] ✓ Query completed successfully")
+    print("=" * 60 + "\n")
 
     return answer

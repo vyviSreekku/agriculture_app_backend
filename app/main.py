@@ -133,29 +133,85 @@ from app.routes import chatbot_routes
 
 
 # ==============================
-# HEAVY IMPORTS (COMMENTED)
+# HEAVY IMPORTS (STARTUP)
 # ==============================
 
-# from contextlib import asynccontextmanager
-# from pathlib import Path
-# from .database import Base, engine
-# from .models import user
-# from .models import crop
-# from .models import community_post
-# from .models import community_post_image
-# from .models import community_comment
+from contextlib import asynccontextmanager
+from pathlib import Path
+from .database import Base, engine
+from .models import user
+from .models import crop
+from .models import community_post
+from .models import community_post_image
+from .models import community_comment
 
-# MiniRAG heavy loading
-# from app.services.Embedding_and_Retrivel import init_minirag, add_json_files
-# import logging
+# MiniRAG heavy loading will be imported during startup to avoid
+# loading heavy models at module import time.
+import logging
+
+
+def _dataset_paths():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    files = [
+        root / "dataset" / "pest.json",
+        root / "dataset" / "weed.json",
+        root / "dataset" / "village_plant_disease_dataset.json",
+    ]
+    return [str(path) for path in files if path.exists()]
+
+
+def _minirag_storage_has_index() -> bool:
+    """Check if a prebuilt MiniRAG index already exists.
+
+    If the vector DB files are present, we can skip the expensive
+    dataset ingestion step during app startup. This is important
+    for Azure App Service, which has a strict startup time limit.
+    """
+    root = Path(__file__).resolve().parents[1]
+    storage_dir = root / "minirag_storage"
+    vdb_path = storage_dir / "vdb_chunks.json"
+    text_path = storage_dir / "kv_store_text_chunks.json"
+    return vdb_path.exists() and text_path.exists()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure DB tables exist
+    Base.metadata.create_all(bind=engine)
+
+    # --- MiniRAG and dataset initialization ---
+    try:
+        logging.info("[STARTUP] Initializing MiniRAG...")
+        # Import here to avoid heavy model loads during normal module import
+        from app.services.Embedding_and_Retrivel import init_minirag, add_json_files
+
+        rag = init_minirag()
+
+        if _minirag_storage_has_index():
+            logging.info("[STARTUP] Existing MiniRAG index detected; skipping dataset ingestion.")
+        else:
+            logging.info("[STARTUP] No existing MiniRAG index detected; loading datasets once...")
+            dataset_files = _dataset_paths()
+            if dataset_files:
+                add_json_files(rag, dataset_files)
+            else:
+                logging.warning("[STARTUP] No dataset files found for MiniRAG initialization.")
+
+        app.state.rag = rag
+        logging.info("[STARTUP] MiniRAG initialization complete.")
+    except Exception as exc:
+        logging.exception(f"[STARTUP] MiniRAG initialization failed: {exc}")
+        app.state.rag = None
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # ==============================
 # FAST START APP
 # ==============================
-
-app = FastAPI()
-
 
 # static files
 os.makedirs("media", exist_ok=True)

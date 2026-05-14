@@ -1,5 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from app.services.weather_service import weather_service
+import asyncio
 import sys
 
 router = APIRouter()
@@ -11,8 +13,11 @@ async def get_current_weather(lat: float = Query(...), lon: float = Query(...)):
     """
     print(f"Received request for current weather at lat:{lat}, lon:{lon}", file=sys.stderr)
     try:
-        weather_data = weather_service.get_weather(lat, lon)
-        location_name = weather_service.get_location_name(lat, lon)
+        # Run blocking weather and geolocation calls in parallel threads
+        weather_data, location_name = await asyncio.gather(
+            run_in_threadpool(weather_service.get_weather, lat, lon),
+            run_in_threadpool(weather_service.get_location_name, lat, lon),
+        )
         formatted_data = weather_service.format_weather(weather_data, location_name)
         return formatted_data
     except Exception as e:

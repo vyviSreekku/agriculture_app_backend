@@ -21,7 +21,7 @@ MANDI_API_KEY=your_mandi_api_key
 - Fertilizer Recommendation API: `/fertilizer/recommend` (POST)
 - Soil Analysis API: `/soil/analyze` (POST - multipart/form-data with image)
 
-For more details about specific endpoints, refer to the documentation in the `app/docs/` folder.
+For more details about specific endpoints, refer to the documentation in the `docs/` folder.
 
 ## Running the Application
 
@@ -42,5 +42,5 @@ http://localhost:8000/docs
 
 ## API Documentation
 
-- Weather API: See `app/docs/WEATHER_DATA_USAGE.md`
-- Market API: See `app/docs/MARKET_API_USAGE.md`
+- Weather API: See `docs/WEATHER_API_USAGE.md`
+- Market API: See `docs/MARKET_API_USAGE.md`

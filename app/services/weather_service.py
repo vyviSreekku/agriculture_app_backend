@@ -7,39 +7,39 @@ from ..utils.api_logger import api_logger
 
 logging.basicConfig(level=logging.INFO)
 
-# Kerala Districts Dictionary
-KERALA_DISTRICTS = {
-    "Thiruvananthapuram": ["Thiruvananthapuram", "Trivandrum", "TVM"],
-    "Kollam": ["Kollam", "Quilon"],
-    "Pathanamthitta": ["Pathanamthitta"],
-    "Alappuzha": ["Alappuzha", "Alleppey"],
-    "Kottayam": ["Kottayam"],
-    "Idukki": ["Idukki"],
-    "Ernakulam": ["Ernakulam", "Kochi", "Cochin"],
-    "Thrissur": ["Thrissur", "Trichur"],
-    "Palakkad": ["Palakkad", "Palghat"],
-    "Malappuram": ["Malappuram"],
-    "Kozhikode": ["Kozhikode", "Calicut"],
-    "Wayanad": ["Wayanad"],
-    "Kannur": ["Kannur", "Cannanore"],
-    "Kasaragod": ["Kasaragod", "Kasargod"]
-}
+# # Kerala Districts Dictionary
+# KERALA_DISTRICTS = {
+#     "Thiruvananthapuram": ["Thiruvananthapuram", "Trivandrum", "TVM"],
+#     "Kollam": ["Kollam", "Quilon"],
+#     "Pathanamthitta": ["Pathanamthitta"],
+#     "Alappuzha": ["Alappuzha", "Alleppey"],
+#     "Kottayam": ["Kottayam"],
+#     "Idukki": ["Idukki"],
+#     "Ernakulam": ["Ernakulam", "Kochi", "Cochin"],
+#     "Thrissur": ["Thrissur", "Trichur"],
+#     "Palakkad": ["Palakkad", "Palghat"],
+#     "Malappuram": ["Malappuram"],
+#     "Kozhikode": ["Kozhikode", "Calicut"],
+#     "Wayanad": ["Wayanad"],
+#     "Kannur": ["Kannur", "Cannanore"],
+#     "Kasaragod": ["Kasaragod", "Kasargod"]
+# }
 
-def find_kerala_district(location_text):
-    """
-    Check if location text matches any Kerala district
-    Returns the standard district name if found, None otherwise
-    """
-    if not location_text:
-        return None
+# def find_kerala_district(location_text):
+#     """
+#     Check if location text matches any Kerala district
+#     Returns the standard district name if found, None otherwise
+#     """
+#     if not location_text:
+#         return None
     
-    location_lower = location_text.lower()
+#     location_lower = location_text.lower()
     
-    for district, aliases in KERALA_DISTRICTS.items():
-        for alias in aliases:
-            if alias.lower() in location_lower:
-                return district
-    return None
+#     for district, aliases in KERALA_DISTRICTS.items():
+#         for alias in aliases:
+#             if alias.lower() in location_lower:
+#                 return district
+#     return None
 
 class WeatherService:
     def __init__(self):
@@ -68,41 +68,41 @@ class WeatherService:
             sublocality = None
             formatted_address = None
             display_name = None
-            kerala_district = None
 
             if data.get("results"):
                 # Search all results for the best short_name
                 for result in data["results"]:
                     ac = result.get("address_components", [])
                     for component in ac:
-                        if not short_name and "locality" in component["types"]:
+                        types = component.get("types", [])
+
+                        # Prefer locality / neighborhood as the human-friendly place name
+                        if not short_name and ("locality" in types or "neighborhood" in types):
                             short_name = component["long_name"]
-                        if not short_name and "sublocality" in component["types"]:
+                        # Fallback to sublocality (often smaller area within locality)
+                        if not short_name and "sublocality" in types:
                             short_name = component["long_name"]
-                        if not short_name and "administrative_area_level_2" in component["types"]:
+                        # Fallback to district-level names when no locality/sublocality present
+                        if not short_name and ("administrative_area_level_2" in types or "administrative_area_level_3" in types):
                             short_name = component["long_name"]
-                        if not district and "administrative_area_level_2" in component["types"]:
+
+                        # District: use administrative_area_level_2 when available,
+                        # otherwise fall back to administrative_area_level_3 (as in your sample JSON)
+                        if not district and ("administrative_area_level_2" in types or "administrative_area_level_3" in types):
                             district = component["long_name"]
-                        if not state and "administrative_area_level_1" in component["types"]:
+
+                        # State (Kerala, etc.)
+                        if not state and "administrative_area_level_1" in types:
                             state = component["long_name"]
-                        if not locality and "locality" in component["types"]:
+
+                        # More detailed locality info for display
+                        if not locality and "locality" in types:
                             locality = component["long_name"]
-                        if not sublocality and "sublocality" in component["types"]:
+                        if not sublocality and ("sublocality" in types or "neighborhood" in types):
                             sublocality = component["long_name"]
                     if not formatted_address and result.get("formatted_address"):
                         formatted_address = result["formatted_address"]
                 
-                # Check if location is in Kerala and find the district
-                if state and "kerala" in state.lower():
-                    # Check all location components for Kerala district match
-                    for location_part in [locality, sublocality, district, short_name, formatted_address]:
-                        if location_part:
-                            kerala_district = find_kerala_district(location_part)
-                            if kerala_district:
-                                # Update district with Kerala district name
-                                district = kerala_district
-                                print(f"Kerala district identified: {kerala_district}")
-                                break
                 # Fallback: use first part of formatted_address if no short_name found
                 if not short_name and formatted_address:
                     short_name = formatted_address.split(",")[0].strip()
@@ -124,15 +124,11 @@ class WeatherService:
                     "sublocality": sublocality,
                     "district": district,
                     "state": state,
-                    "kerala_district": kerala_district,  # Add Kerala district identifier
-                    "is_kerala": state and "kerala" in state.lower(),
                     "coordinates": {
                         "lat": latitude,
                         "lon": longitude
                     }
                 }
-                if kerala_district:
-                    print(f"✓ Kerala District: {kerala_district}")
                 # Log the processed location data
                 api_logger.log_geolocation_response(latitude, longitude, {"processed_location": location_data})
                 return location_data
@@ -205,7 +201,7 @@ class WeatherService:
         try:
             # Access nested data
             condition = weather_data.get("weatherCondition", {}).get("description", {}).get("text", "N/A")
-            print(f"Weather condition: {condition}")
+            # print(f"Weather condition: {condition}")
         except Exception as e:
             print(f"Error processing weather condition: {e}")
             logging.error(f"Error processing weather data: {e}")
