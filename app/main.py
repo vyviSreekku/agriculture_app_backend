@@ -154,9 +154,9 @@ def _dataset_paths():
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]
     files = [
-        root / "dataset" / "pest.json",
-        root / "dataset" / "weed.json",
-        root / "dataset" / "village_plant_disease_dataset.json",
+        root / "app" / "dataset" / "pest.json",
+        root / "app" / "dataset" / "weed.json",
+        root / "app" / "dataset" / "village_plant_disease_dataset.json",
     ]
     return [str(path) for path in files if path.exists()]
 
@@ -168,11 +168,24 @@ def _minirag_storage_has_index() -> bool:
     dataset ingestion step during app startup. This is important
     for Azure App Service, which has a strict startup time limit.
     """
+    # Local path (repo root)
     root = Path(__file__).resolve().parents[1]
-    storage_dir = root / "minirag_storage"
-    vdb_path = storage_dir / "vdb_chunks.json"
-    text_path = storage_dir / "kv_store_text_chunks.json"
-    return vdb_path.exists() and text_path.exists()
+    local_storage_dir = root / "minirag_storage"
+
+    # Azure App Service Linux note: only /home is persisted.
+    azure_storage_dir = Path("/home/site/wwwroot/minirag_storage")
+
+    candidate_dirs = [local_storage_dir]
+    if str(azure_storage_dir).startswith("/home"):
+        candidate_dirs.append(azure_storage_dir)
+
+    for storage_dir in candidate_dirs:
+        vdb_path = storage_dir / "vdb_chunks.json"
+        text_path = storage_dir / "kv_store_text_chunks.json"
+        if vdb_path.exists() and text_path.exists():
+            return True
+
+    return False
 
 
 @asynccontextmanager

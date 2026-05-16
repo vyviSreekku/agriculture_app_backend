@@ -1,6 +1,6 @@
-from minirag import MiniRAG
-from minirag.utils import EmbeddingFunc
-from typing import List, Dict, Any, Optional
+from __future__ import annotations
+
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import json
 import os
 import time
@@ -8,24 +8,33 @@ import asyncio
 import warnings
 import re
 import numpy as np
-from sentence_transformers import SentenceTransformer
+
+if TYPE_CHECKING:
+    from minirag import MiniRAG  # pragma: no cover
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:  # pragma: no cover
+    SentenceTransformer = None  # type: ignore[assignment]
 
 # Suppress MiniRAG graph warnings (clean console)
 warnings.filterwarnings("ignore", category=UserWarning, module="minirag")
 
 # ---------------- GEMINI SETUP ----------------
 
-from google import genai
+def _get_gemini_client():
+    """Create Gemini client lazily.
 
-# 🔴 IMPORTANT: DO NOT hardcode key in real project
-# Set once in terminal:
-# setx GEMINI_API_KEY "YOUR_API_KEY"
+    This keeps app startup resilient on Azure (where env vars may not be set
+    for non-chatbot endpoints) and avoids importing heavy SDKs at import time.
+    """
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set in environment variables")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyADsKd9Vl967GhthoVwHFjKKM3phu6sde0").strip()
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set. Please set it in your environment before starting the backend.")
+    from google import genai
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(api_key=api_key)
 
 # Try preferred model first, then fall back to broadly available free-tier models.
 MODEL_CANDIDATES = [
@@ -44,19 +53,29 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 5
 TARGET_CHUNK_CHARS = 1800
 
-embedding_model = SentenceTransformer(EMBED_MODEL)
+_embedding_model = None
+
+
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is not None:
+        return _embedding_model
+
+    if SentenceTransformer is None:
+        raise RuntimeError(
+            "sentence-transformers is not available in this environment; "
+            "install it or disable embedding-based retrieval"
+        )
+
+    _embedding_model = SentenceTransformer(EMBED_MODEL)
+    return _embedding_model
 
 async def embedding_func_impl(texts: List[str]) -> List[List[float]]:
     print(f"[EMBEDDING] Generating embeddings for {len(texts)} text(s)...")
-    result = embedding_model.encode(texts, convert_to_tensor=False).tolist()
+    model = _get_embedding_model()
+    result = model.encode(texts, convert_to_tensor=False).tolist()
     print("[EMBEDDING] ✓ Embeddings generated")
     return result
-
-embedding_func = EmbeddingFunc(
-    embedding_dim=embedding_model.get_sentence_embedding_dimension(),
-    max_token_size=512,
-    func=embedding_func_impl
-)
 
 # ---------------- DISABLE ENTITY EXTRACTION ----------------
 
@@ -78,18 +97,59 @@ def run_async(coro):
 def init_minirag():
     print("[INIT] Initializing MiniRAG...")
 
-    os.makedirs("./minirag_storage", exist_ok=True)
+    storage_dir = _resolve_storage_dir()
+    os.makedirs(storage_dir, exist_ok=True)
 
-    rag = MiniRAG(
-        working_dir="./minirag_storage",
-        chunk_token_size=900,
-        chunk_overlap_token_size=150,
-        embedding_func=embedding_func,
-        llm_model_func=gemini_llm_func_noop
-    )
+    # Import MiniRAG lazily so the app can boot even if the installed minirag
+    # package is broken/incompatible in the host environment.
+    try:
+        from minirag import MiniRAG
+        from minirag.utils import EmbeddingFunc
 
-    print("[INIT] ✓ MiniRAG initialized successfully")
-    return rag
+        model = _get_embedding_model()
+        embedding_func = EmbeddingFunc(
+            embedding_dim=model.get_sentence_embedding_dimension(),
+            max_token_size=512,
+            func=embedding_func_impl,
+        )
+
+        rag = MiniRAG(
+            working_dir=storage_dir,
+            chunk_token_size=900,
+            chunk_overlap_token_size=150,
+            embedding_func=embedding_func,
+            llm_model_func=gemini_llm_func_noop,
+        )
+
+        print("[INIT] ✓ MiniRAG initialized successfully")
+        return rag
+
+    except Exception as exc:
+        # Fallback: return a lightweight object that still allows retrieval
+        # from prebuilt minirag_storage files.
+        print(f"[INIT] MiniRAG import/init failed; falling back to offline retrieval only: {exc}")
+        return {"working_dir": storage_dir, "mode": "offline"}
+
+
+def _resolve_storage_dir() -> str:
+    """Resolve a writable/persistent storage location.
+
+    - Local dev: ./minirag_storage
+    - Azure App Service Linux: prefer /home/... because only /home is persisted.
+    """
+
+    # Allow explicit override (recommended for production)
+    override = (os.getenv("MINIRAG_WORKDIR") or "").strip()
+    if override:
+        return override
+
+    # Azure App Service Linux commonly has HOME=/home
+    home = (os.getenv("HOME") or "").strip()
+    if home == "/home":
+        persisted = "/home/site/wwwroot/minirag_storage"
+        return persisted
+
+    return "./minirag_storage"
 
 # ---------------- JSON → NATURAL LANGUAGE FORMATTER ----------------
 
@@ -223,6 +283,12 @@ def load_json_file(file_path: str) -> List[str]:
 def add_json_files(rag: MiniRAG, json_paths: List[str]):
     print(f"\n[INSERT] Processing {len(json_paths)} JSON file(s)...")
 
+    if isinstance(rag, dict) and rag.get("mode") == "offline":
+        raise RuntimeError(
+            "MiniRAG is not available in this environment, so indexing cannot run here. "
+            "Deploy with a working minirag package or prebuild and ship minirag_storage." 
+        )
+
     for i, path in enumerate(json_paths, 1):
         print(f"\n[INSERT] File {i}/{len(json_paths)}: {path}")
 
@@ -252,8 +318,13 @@ def retrieve_with_minirag(rag, query: str, top_k: int = TOP_K) -> List[str]:
         print(f"[RETRIEVE] Generated query embedding (dim={len(query_embedding)})")
 
         # Step 2: Load vector DB (embeddings) and text chunks
-        vdb_path = "./minirag_storage/vdb_chunks.json"
-        text_path = "./minirag_storage/kv_store_text_chunks.json"
+        storage_dir = None
+        if isinstance(rag, dict):
+            storage_dir = rag.get("working_dir")
+        storage_dir = storage_dir or "./minirag_storage"
+
+        vdb_path = os.path.join(storage_dir, "vdb_chunks.json")
+        text_path = os.path.join(storage_dir, "kv_store_text_chunks.json")
         if not os.path.exists(vdb_path) or not os.path.exists(text_path):
             print(f"[DEBUG] Missing storage files; vdb_chunks or kv_store_text_chunks not found")
             return []
@@ -368,6 +439,15 @@ Answer:
 """
 
     last_error = None
+
+    try:
+        client = _get_gemini_client()
+    except Exception as exc:
+        return (
+            "Gemini is not configured on the server. "
+            "Set the GEMINI_API_KEY environment variable and redeploy. "
+            f"(details: {exc})"
+        )
 
     for model_name in MODEL_CANDIDATES:
         try:
