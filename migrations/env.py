@@ -71,15 +71,22 @@ def run_migrations_online() -> None:
         with context.begin_transaction():
             context.run_migrations()
 
-# Import your models' Base metadata
+# Import app settings / Base metadata
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # if needed
-from app.database import Base
-target_metadata = Base.metadata
 
-# Use DATABASE_URL env var
-DATABASE_URL = os.getenv("DATABASE_URL")
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # allow `import app.*`
+
+from app.config import settings
+
+database_url = settings.DATABASE_URL
+if not database_url:
+    raise RuntimeError("DATABASE_URL is not configured")
+
+config.set_main_option("sqlalchemy.url", database_url)
+
+from app.database import Base
+
+target_metadata = Base.metadata
 
 if context.is_offline_mode():
     run_migrations_offline()

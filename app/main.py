@@ -139,6 +139,8 @@ from app.routes import chatbot_routes
 from contextlib import asynccontextmanager
 from pathlib import Path
 from .database import Base, engine
+from sqlalchemy import inspect
+from urllib.parse import urlparse, urlunparse
 from .models import user
 from .models import crop
 from .models import community_post
@@ -148,6 +150,33 @@ from .models import community_comment
 # MiniRAG heavy loading will be imported during startup to avoid
 # loading heavy models at module import time.
 import logging
+
+
+def _safe_db_url_for_logs(url: str) -> str:
+    """Return a redacted DB URL safe to write to logs."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "<unparseable DATABASE_URL>"
+
+    if not parsed.scheme:
+        return "<missing scheme>"
+
+    if parsed.scheme.startswith("sqlite"):
+        return url
+
+    # Redact password if present.
+    if parsed.password is None:
+        return url
+
+    netloc = parsed.netloc
+    # netloc is like user:pass@host:port
+    if "@" in netloc and ":" in netloc.split("@", 1)[0]:
+        userinfo, hostinfo = netloc.split("@", 1)
+        user = userinfo.split(":", 1)[0]
+        netloc = f"{user}:***@{hostinfo}"
+
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 def _dataset_paths():
@@ -191,7 +220,89 @@ def _minirag_storage_has_index() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure DB tables exist
-    Base.metadata.create_all(bind=engine)
+    try:
+        db_url = getattr(engine, "url", None)
+        logging.info(f"[STARTUP] Database URL: {_safe_db_url_for_logs(str(db_url) if db_url else 'unknown')}")
+
+        # Fail fast if DB is unreachable.
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        logging.info("[STARTUP] Database connection: OK")
+
+        Base.metadata.create_all(bind=engine)
+        logging.info("[STARTUP] Base.metadata.create_all(): complete")
+
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+        expected_tables = {
+            "users",
+            "crops",
+            "community_posts",
+            "community_post_images",
+            "community_comments",
+        }
+        missing_tables = sorted(expected_tables - existing_tables)
+        logging.info(f"[STARTUP] Tables found: {sorted(existing_tables)}")
+        if missing_tables:
+            logging.warning(f"[STARTUP] Expected tables missing AFTER create_all(): {missing_tables}")
+        else:
+            logging.info("[STARTUP] Expected tables exist: OK")
+
+        # Column-level sanity checks (helps confirm correct schema in Azure Log Stream)
+        expected_columns = {
+            "users": {
+                "id",
+                "full_name",
+                "phone",
+                "weather_alert",
+                "pest_alert",
+                "market_update",
+                "notification_alert",
+                "created_at",
+                "updated_at",
+                "image_url",
+                "location_name",
+                "location_state",
+                "location_district",
+            },
+            "crops": {"id", "user_id", "name", "created_at", "updated_at"},
+            "community_posts": {
+                "id",
+                "user_id",
+                "title",
+                "content",
+                "image_url",
+                "likes_count",
+                "comments_count",
+                "created_at",
+                "updated_at",
+            },
+            "community_comments": {
+                "id",
+                "post_id",
+                "user_id",
+                "content",
+                "created_at",
+                "updated_at",
+            },
+            "community_post_images": {"id", "post_id", "image_url", "created_at"},
+        }
+
+        for table_name, cols_expected in expected_columns.items():
+            if table_name not in existing_tables:
+                continue
+            cols_actual = {col.get("name") for col in inspector.get_columns(table_name) if isinstance(col, dict)}
+            missing_cols = sorted(set(cols_expected) - set(cols_actual))
+            if missing_cols:
+                logging.warning(
+                    f"[STARTUP] Missing columns in {table_name}: {missing_cols} (create_all does not alter existing tables)"
+                )
+            else:
+                logging.info(f"[STARTUP] Columns OK for {table_name}")
+
+    except Exception as exc:
+        logging.exception(f"[STARTUP] Database initialization failed: {exc}")
+        raise
 
     # --- MiniRAG and dataset initialization ---
     try:
