@@ -51,6 +51,41 @@ DB_SSLMODE=require
 
 For more details about specific endpoints, refer to the documentation in the `docs/` folder.
 
+## Firebase Phone Auth (OTP) login/signup
+
+This backend supports login/signup using **Firebase Phone Authentication**.
+
+High-level flow:
+1. Client (web/mobile) completes Firebase Phone OTP verification.
+2. Client obtains a Firebase **ID token**.
+3. Client calls the backend endpoint with `Authorization: Bearer <ID_TOKEN>`.
+4. Backend verifies the token using **Firebase Admin** and uses the verified `phone_number` claim as the user identity.
+
+Note: OTP is handled by Firebase on the client. The backend does not send SMS OTP itself.
+
+### Backend endpoint
+
+- `POST /users/firebase/login`
+	- Header: `Authorization: Bearer <FIREBASE_ID_TOKEN>`
+	- Body (optional): `full_name`, `location_name`, `location_state`, `location_district`
+
+### Firebase Admin credentials (required)
+
+The backend must be configured with a **Firebase Admin service account JSON**.
+The Firebase *web* config (`apiKey`, `authDomain`, etc.) is **frontend-only** and cannot be used to verify tokens on the backend.
+
+Set one of these environment variables (recommended for Azure App Service: set in **Configuration → Application settings**):
+
+Option A (recommended): point to a JSON file on disk
+```
+FIREBASE_SERVICE_ACCOUNT_FILE=/home/site/wwwroot/firebase-service-account.json
+```
+
+Option B: provide the JSON content as a single-line string
+```
+FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+```
+
 ## Running the Application
 
 1. Install dependencies:

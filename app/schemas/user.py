@@ -42,3 +42,10 @@ class UserLogin(BaseModel):
     location_state: Optional[str] = None
     location_name: Optional[str] = None
 
+
+class FirebaseLoginRequest(BaseModel):
+    full_name: Optional[str] = None
+    location_name: Optional[str] = None
+    location_state: Optional[str] = None
+    location_district: Optional[str] = None
+

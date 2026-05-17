@@ -13,3 +13,12 @@ build/
 # Logs
 logs/
 *.log
+
+# Local environment
+.env
+.env.*
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
