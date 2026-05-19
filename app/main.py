@@ -130,6 +130,7 @@ from app.routes import weed_routes
 from app.routes import soil_ph_routes
 from app.routes import user_routes
 from app.routes import chatbot_routes
+from app.routes import leaf_routes
 
 
 # ==============================
@@ -367,6 +368,7 @@ app.include_router(weed_routes.router)
 app.include_router(soil_ph_routes.router)
 app.include_router(user_routes.router)
 app.include_router(chatbot_routes.router)
+app.include_router(leaf_routes.router)
 
 
 # ==============================
