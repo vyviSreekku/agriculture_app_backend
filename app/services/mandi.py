@@ -1,5 +1,5 @@
-import requests
 import json
+import subprocess
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Union
 from ..config import settings
@@ -14,8 +14,9 @@ def get_mandi_prices(
     arrival_date: Optional[str] = None,
     api_key: str = None,
     format: str = "json",
-    offset: int = 15,
-    sort_by: str = "Market"
+    offset: int = 0,
+    limit: int = 10,
+    sort_by: Optional[str] = "Arrival_Date",
 ) -> Union[Dict[str, Any], str, None]:
     """
     Fetch agricultural market prices from the Mandi API.
@@ -29,8 +30,7 @@ def get_mandi_prices(
     - format: Output format (json, xml, csv)
     - offset: Number of records to skip
     - limit: Maximum number of records to return
-    - sort_by: Sort results by field
-    
+    - sort_by: Field name to sort descending (default: Arrival_Date)
     Returns:
     - The API response in the specified format
     """
@@ -54,20 +54,56 @@ def get_mandi_prices(
     if arrival_date:
         params["filters[Arrival_Date]"] = arrival_date
     
-    # Add sort parameter if provided
-    if sort_by:
-        params[f"sort[{sort_by}]"] = "asc"
-    
     try:
-        response = requests.get(BASE_URL, params=params, timeout=60)  # 60 second timeout for very slow API
-        response.raise_for_status()  # Raise exception for bad responses
-        
+        curl_command = [
+            "curl.exe",
+            "-sS",
+            "-G",
+            BASE_URL,
+            "--data-urlencode",
+            f"api-key={api_key}",
+            "--data-urlencode",
+            f"format={format}",
+            "--data-urlencode",
+            f"offset={offset}",
+            "--data-urlencode",
+            f"limit={limit}",
+        ]
+
+        if state:
+            curl_command.extend(["--data-urlencode", f"filters[State]={state}"])
+        if district:
+            curl_command.extend(["--data-urlencode", f"filters[District]={district}"])
+        if commodity:
+            curl_command.extend(["--data-urlencode", f"filters[Commodity]={commodity}"])
+        if arrival_date:
+            curl_command.extend(["--data-urlencode", f"filters[Arrival_Date]={arrival_date}"])
+        if sort_by:
+            curl_command.extend(["--data-urlencode", f"sort[{sort_by}]=desc"])
+
+        print(f"Prepared request URL: {BASE_URL}?api-key={api_key}&format={format}&offset={offset}&limit={limit}")
+
+        completed = subprocess.run(
+            curl_command,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+        if completed.returncode != 0:
+            error_message = completed.stderr.strip() or completed.stdout.strip() or f"curl exited with code {completed.returncode}"
+            print(f"Error fetching mandi data: {error_message}")
+            return None
+
         if format == "json":
-            return response.json()
-        else:
-            return response.text
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching mandi data: {e}")
+            return json.loads(completed.stdout)
+        return completed.stdout
+    except subprocess.TimeoutExpired as e:
+        print(f"Error fetching mandi data (timeout): {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Error parsing mandi JSON: {e}")
         return None
 
 def process_mandi_data(data: Dict[str, Any], max_records: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -202,6 +238,8 @@ async def get_crop_prices(
         district=district,
         commodity=crop,
         arrival_date=arrival_date,
+        limit=limit,
+        sort_by="Arrival_Date",
     )
     
     # Check if we got valid data
