@@ -100,6 +100,16 @@ class ChatbotQueryRequest(BaseModel):
 class ChatbotQueryResponse(BaseModel):
     question: str
     answer: str
+    formatted_answer: list[str]
+
+
+def _format_gemini_answer(answer: str) -> list[str]:
+    """Convert Gemini text into a simple JSON-friendly line format."""
+    if not answer:
+        return []
+
+    lines = [line.strip() for line in answer.splitlines()]
+    return [line for line in lines if line]
 
 
 @router.get("/health")
@@ -130,7 +140,11 @@ def chatbot_query(payload: ChatbotQueryRequest, request: Request):
     try:
         rag = _get_rag_from_app(request)
         answer = rag_query(rag, question)
-        return ChatbotQueryResponse(question=question, answer=answer)
+        return ChatbotQueryResponse(
+            question=question,
+            answer=answer,
+            formatted_answer=_format_gemini_answer(answer),
+        )
     except HTTPException:
         raise
     except Exception as exc:
