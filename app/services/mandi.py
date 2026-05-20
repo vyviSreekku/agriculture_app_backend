@@ -56,7 +56,7 @@ def get_mandi_prices(
     
     try:
         curl_command = [
-            "curl.exe",
+            "curl",
             "-sS",
             "-G",
             BASE_URL,
